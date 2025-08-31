@@ -56,6 +56,7 @@ class Config:
     OWNER_ID: int = int(os.getenv('BOT_OWNER_ID', 0))
     GAME_TIMEOUT: int = int(os.getenv('GAME_TIMEOUT', 60))
     MAX_CARD_VALUE: int = int(os.getenv('MAX_CARD_VALUE', 11))
+    STARTING_HP: int = int(os.getenv('STARTING_HP', 7))
     STATS_FILE: str = "game_stats.json"
     BOT_PREFIX: str = "#"
 
@@ -73,6 +74,11 @@ class GameStatus(Enum):
     THINKING = "🤔 Thinking"
     READY = "✅ Ready"
     BUST = "💥 BUST"
+
+class MatchStatus(Enum):
+    ACTIVE = "active"
+    ELIMINATION = "elimination"
+    REMATCH_PENDING = "rematch_pending"
 
 @dataclass
 class PlayerData:
@@ -93,10 +99,61 @@ class PlayerData:
     def score(self) -> int:
         return self.total if not self.is_bust else 0
 
+@dataclass
+class MatchPlayerData:
+    """HP and match data for players"""
+    user: discord.Member
+    hp: int = config.STARTING_HP
+    
+    @property
+    def is_eliminated(self) -> bool:
+        return self.hp <= 0
+
+@dataclass
+class MatchData:
+    """Complete match data with HP system"""
+    player1: MatchPlayerData
+    player2: MatchPlayerData
+    game_number: int = 1
+    status: MatchStatus = MatchStatus.ACTIVE
+    channel: discord.TextChannel = None
+    
+    @property
+    def current_bet(self) -> int:
+        return self.game_number
+    
+    @property
+    def has_elimination(self) -> bool:
+        return self.player1.is_eliminated or self.player2.is_eliminated
+    
+    @property
+    def winner(self) -> Optional[MatchPlayerData]:
+        if self.player1.is_eliminated:
+            return self.player2
+        elif self.player2.is_eliminated:
+            return self.player1
+        return None
+    
+    def get_player_data(self, user_id: int) -> Optional[MatchPlayerData]:
+        """Get match player data by user ID"""
+        if self.player1.user.id == user_id:
+            return self.player1
+        elif self.player2.user.id == user_id:
+            return self.player2
+        return None
+    
+    def get_opponent_data(self, user_id: int) -> Optional[MatchPlayerData]:
+        """Get opponent match data by user ID"""
+        if self.player1.user.id == user_id:
+            return self.player2
+        elif self.player2.user.id == user_id:
+            return self.player1
+        return None
+
 # ==================== STATISTICS MANAGER ====================
 
 class StatsManager:
-    """Efficient statistics management with caching"""
+    """Enhanced statistics management with match points"""
     
     def __init__(self, stats_file: str):
         self.stats_file = stats_file
@@ -127,24 +184,46 @@ class StatsManager:
     
     def get_user_stats(self, user_id: int) -> Dict[str, int]:
         """Get user statistics"""
-        return self._cache.get(str(user_id), {'wins': 0, 'losses': 0})
+        return self._cache.get(str(user_id), {
+            'wins': 0, 
+            'losses': 0, 
+            'match_wins': 0, 
+            'match_losses': 0
+        })
     
     def update_game_result(self, winner_id: int, loser_id: int) -> None:
-        """Update game statistics"""
+        """Update single game statistics"""
         winner_key, loser_key = str(winner_id), str(loser_id)
         
         # Initialize if not exists
         if winner_key not in self._cache:
-            self._cache[winner_key] = {'wins': 0, 'losses': 0}
+            self._cache[winner_key] = {'wins': 0, 'losses': 0, 'match_wins': 0, 'match_losses': 0}
         if loser_key not in self._cache:
-            self._cache[loser_key] = {'wins': 0, 'losses': 0}
+            self._cache[loser_key] = {'wins': 0, 'losses': 0, 'match_wins': 0, 'match_losses': 0}
         
-        # Update stats
+        # Update game stats
         self._cache[winner_key]['wins'] += 1
         self._cache[loser_key]['losses'] += 1
         self._cache_dirty = True
         
-        logger.info(f"Stats updated: Winner {winner_id}, Loser {loser_id}")
+        logger.info(f"Game stats updated: Winner {winner_id}, Loser {loser_id}")
+    
+    def update_match_result(self, winner_id: int, loser_id: int) -> None:
+        """Update match statistics"""
+        winner_key, loser_key = str(winner_id), str(loser_id)
+        
+        # Initialize if not exists
+        if winner_key not in self._cache:
+            self._cache[winner_key] = {'wins': 0, 'losses': 0, 'match_wins': 0, 'match_losses': 0}
+        if loser_key not in self._cache:
+            self._cache[loser_key] = {'wins': 0, 'losses': 0, 'match_wins': 0, 'match_losses': 0}
+        
+        # Update match stats
+        self._cache[winner_key]['match_wins'] += 1
+        self._cache[loser_key]['match_losses'] += 1
+        self._cache_dirty = True
+        
+        logger.info(f"Match stats updated: Winner {winner_id}, Loser {loser_id}")
 
 # Global stats manager
 stats_manager = StatsManager(config.STATS_FILE)
@@ -152,12 +231,13 @@ stats_manager = StatsManager(config.STATS_FILE)
 # ==================== GAME STATE MANAGEMENT ====================
 
 class GameState:
-    """Enhanced game state with better resource management"""
+    """Enhanced game state with HP system integration"""
     
-    def __init__(self, player1: discord.Member, player2: discord.Member, channel: discord.TextChannel):
+    def __init__(self, player1: discord.Member, player2: discord.Member, channel: discord.TextChannel, match_data: MatchData):
         self.player1 = PlayerData(player1, [])
         self.player2 = PlayerData(player2, [])
         self.channel = channel
+        self.match_data = match_data
         
         # Initialize deck and deal cards
         self.deck = list(range(1, config.MAX_CARD_VALUE + 1))
@@ -204,7 +284,7 @@ class GameState:
             if self.current_turn_id == self.player1.user.id 
             else self.player1.user.id
         )
-        self.reset_turn_timer()  # Always reset to full time on turn switch
+        self.reset_turn_timer()
     
     def add_task(self, task: asyncio.Task) -> None:
         """Add task for cleanup tracking"""
@@ -228,8 +308,9 @@ class GameState:
         """Check if both players have continued"""
         return self.player1.continued and self.player2.continued
 
-# Game storage
+# Game and match storage
 active_games: Dict[frozenset, GameState] = {}
+active_matches: Dict[frozenset, MatchData] = {}
 
 # ==================== ERROR HANDLING UTILITY ====================
 
@@ -253,14 +334,14 @@ async def handle_command_error(interaction: discord.Interaction, error: Exceptio
 # ==================== EMBED CREATORS ====================
 
 class EmbedCreator:
-    """Centralized embed creation with consistent styling"""
+    """Enhanced embed creation with HP system"""
     
     @staticmethod
     def create_help_embed() -> discord.Embed:
-        """Create help embed"""
+        """Create help embed with HP system explanation"""
         embed = discord.Embed(
-            title="🎲 Twenty One Bot - Help",
-            description="A card game where you try to get as close to 21 as possible without going over!",
+            title="🎲 Twenty One Bot - HP Battle System",
+            description="A card game where you battle with HP! Get as close to 21 as possible without going over!",
             color=discord.Color.blue()
         )
         
@@ -268,20 +349,27 @@ class EmbedCreator:
             ("🎯 How to Play", 
              "Get cards totaling as close to 21 as possible without going over. "
              "You start with 1 hidden card, then take more cards that become visible to opponents.", False),
-            ("🚀 Start Game", "`/play @opponent` - Challenge another player", False),
+            ("❤️ HP Battle System",
+             f"• Both players start with **{config.STARTING_HP} HP**\n"
+             "• Game 1 bets **1 HP**, Game 2 bets **2 HP**, etc.\n"
+             "• Winner takes HP, loser loses HP\n"
+             "• First to reach **0 HP or less** is eliminated!\n"
+             "• Match winner gets **1 Match Point**", False),
+            ("🚀 Start Match", "`/play @opponent` - Challenge another player to HP battle", False),
             ("🎴 Game Controls", 
-             "**🃏 View Cards Button** - Click to see your current hand\n"
-             "`/drink` - Take another card\n"
-             "`/continue` - Keep current cards and end turn", False),
+             "**🃏 View Cards** - Click to see your current hand\n"
+             "**🎲 Take Card** - Draw another card (adds to visible cards)\n"
+             "**✋ Stay** - Keep current cards and end your turn", False),
             ("❓ Other Commands", 
              "`/help` - Show this help message\n"
-             "`/profil @user` - View player statistics", False)
+             "`/profil @user` - View player statistics\n"
+             "`/stats` - View your own statistics", False)
         ]
         
         for name, value, inline in fields:
             embed.add_field(name=name, value=value, inline=inline)
         
-        embed.set_footer(text="All game interactions are private to you!")
+        embed.set_footer(text="Battle until elimination! Use buttons for all interactions!")
         return embed
     
     @staticmethod
@@ -309,14 +397,31 @@ class EmbedCreator:
     
     @staticmethod
     def create_game_embed(game_state: GameState) -> discord.Embed:
-        """Create public game embed"""
+        """Create public game embed with HP display"""
         p1, p2 = game_state.player1, game_state.player2
         current_player = game_state.get_current_player()
+        match_data = game_state.match_data
         
         embed = discord.Embed(
-            title="🎲 Twenty One Battle",
+            title=f"🎲 HP Battle - Game {match_data.game_number}",
             description=f"⚔️ {p1.user.mention} **VS** {p2.user.mention}",
             color=discord.Color.gold()
+        )
+        
+        # HP Display
+        p1_match = match_data.get_player_data(p1.user.id)
+        p2_match = match_data.get_player_data(p2.user.id)
+        
+        embed.add_field(
+            name="❤️ Health Points",
+            value=f"{p1.user.mention}: **{p1_match.hp} HP**\n{p2.user.mention}: **{p2_match.hp} HP**",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="💰 Current Bet",
+            value=f"**{match_data.current_bet} HP** at stake this game!",
+            inline=False
         )
         
         # Show visible cards (first card hidden, rest visible)
@@ -359,14 +464,6 @@ class EmbedCreator:
             inline=False
         )
         
-        embed.add_field(
-            name="💡 How to Play",
-            value="🃏 **Click 'View Cards' button** to see your hand\n"
-                  "📱 Use `/drink` to take a card or `/continue` to pass\n"
-                  "🎯 First card stays hidden, additional cards are visible",
-            inline=False
-        )
-        
         embed.set_footer(
             text=f"🎯 Current turn: {current_player.user.display_name}",
             icon_url=current_player.user.display_avatar.url
@@ -380,10 +477,11 @@ class EmbedCreator:
         winner: Optional[discord.Member] = None, 
         timed_out_player: Optional[discord.Member] = None
     ) -> discord.Embed:
-        """Create endgame results embed"""
+        """Create endgame results embed with HP changes"""
         p1, p2 = game_state.player1, game_state.player2
+        match_data = game_state.match_data
         
-        embed = discord.Embed(title="🏁 Game Over!", color=discord.Color.gold())
+        embed = discord.Embed(title=f"🏁 Game {match_data.game_number} Over!", color=discord.Color.gold())
         
         # Set description based on end reason
         if reason == GameEndReason.BUST:
@@ -418,11 +516,73 @@ class EmbedCreator:
             inline=False
         )
         
+        # Show HP changes
+        p1_match = match_data.get_player_data(p1.user.id)
+        p2_match = match_data.get_player_data(p2.user.id)
+        
+        embed.add_field(
+            name="❤️ HP After This Game",
+            value=f"{p1.user.mention}: **{p1_match.hp} HP**\n{p2.user.mention}: **{p2_match.hp} HP**",
+            inline=False
+        )
+        
+        # Show what happens next
+        if match_data.has_elimination:
+            eliminated_player = p1.user if p1_match.is_eliminated else p2.user
+            embed.add_field(
+                name="🚨 ELIMINATION!",
+                value=f"💀 **{eliminated_player.mention}** has been eliminated!\n"
+                      f"🏆 Match winner will be decided soon!",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="🔄 Next Game",
+                value=f"⏳ **Game {match_data.game_number + 1}** will start soon!\n"
+                      f"💰 Next bet: **{match_data.game_number + 1} HP**",
+                inline=False
+            )
+        
+        return embed
+    
+    @staticmethod
+    def create_elimination_embed(match_data: MatchData) -> discord.Embed:
+        """Create elimination/match end embed"""
+        winner = match_data.winner
+        eliminated = match_data.player1 if match_data.player1.is_eliminated else match_data.player2
+        
+        embed = discord.Embed(
+            title="💀 ELIMINATION! Match Over!",
+            description=f"🏆 **{winner.user.mention}** WINS THE MATCH!\n💀 **{eliminated.user.mention}** has been eliminated!",
+            color=discord.Color.red()
+        )
+        
+        embed.add_field(
+            name="🎯 Match Results",
+            value=f"**Winner**: {winner.user.mention} with **{winner.hp} HP** remaining\n"
+                  f"**Eliminated**: {eliminated.user.mention} with **{eliminated.hp} HP**",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📊 Match Summary", 
+            value=f"**Total Games Played**: {match_data.game_number}\n"
+                  f"**Match Points Earned**: 1 point to {winner.user.mention}",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="🔄 What's Next?",
+            value="Click **✅ Rematch** to start a new HP battle!\n"
+                  "Click **❌ Exit** to end the session.",
+            inline=False
+        )
+        
         return embed
     
     @staticmethod
     def create_profile_embed(user: discord.Member, user_stats: Dict[str, int]) -> discord.Embed:
-        """Create profile statistics embed"""
+        """Create enhanced profile statistics embed"""
         embed = discord.Embed(
             title=f"📊 Game Profile - {user.display_name}",
             color=discord.Color.purple()
@@ -432,28 +592,46 @@ class EmbedCreator:
         if not any(user_stats.values()):
             embed.description = "This player hasn't played any games yet."
         else:
+            # Game stats
             wins = user_stats.get('wins', 0)
             losses = user_stats.get('losses', 0)
             total_games = wins + losses
             win_rate = (wins / total_games * 100) if total_games > 0 else 0
             
-            embed.add_field(name="🏆 Wins", value=f"**{wins}**", inline=True)
-            embed.add_field(name="💔 Losses", value=f"**{losses}**", inline=True)
-            embed.add_field(name="📈 Win Rate", value=f"**{win_rate:.1f}%**", inline=True)
-            embed.add_field(name="⚔️ Total Games", value=f"**{total_games}**", inline=False)
+            # Match stats  
+            match_wins = user_stats.get('match_wins', 0)
+            match_losses = user_stats.get('match_losses', 0)
+            total_matches = match_wins + match_losses
+            match_win_rate = (match_wins / total_matches * 100) if total_matches > 0 else 0
+            
+            embed.add_field(name="🎮 Game Statistics", value="\u200b", inline=False)
+            embed.add_field(name="🏆 Game Wins", value=f"**{wins}**", inline=True)
+            embed.add_field(name="💔 Game Losses", value=f"**{losses}**", inline=True)
+            embed.add_field(name="📈 Game Win Rate", value=f"**{win_rate:.1f}%**", inline=True)
+            
+            embed.add_field(name="⚔️ Match Statistics", value="\u200b", inline=False)
+            embed.add_field(name="🏅 Match Wins", value=f"**{match_wins}**", inline=True)
+            embed.add_field(name="💀 Match Losses", value=f"**{match_losses}**", inline=True)
+            embed.add_field(name="🎯 Match Win Rate", value=f"**{match_win_rate:.1f}%**", inline=True)
+            
+            embed.add_field(
+                name="📊 Total Summary",
+                value=f"**Games Played**: {total_games}\n**Matches Played**: {total_matches}",
+                inline=False
+            )
         
         return embed
 
 # ==================== UI COMPONENTS ====================
 
 class GameView(discord.ui.View):
-    """Enhanced view with better error handling"""
+    """Enhanced view with game action buttons"""
     
     def __init__(self, game_key: frozenset):
         super().__init__(timeout=None)
         self.game_key = game_key
     
-    @discord.ui.button(label="🃏 View Cards", style=discord.ButtonStyle.primary, custom_id="view_cards")
+    @discord.ui.button(label="🃏 View Cards", style=discord.ButtonStyle.secondary, custom_id="view_cards")
     async def view_cards(self, interaction: discord.Interaction, button: discord.ui.Button):
         """View cards button callback"""
         try:
@@ -493,11 +671,294 @@ class GameView(discord.ui.View):
                 )
             except:
                 pass
+    
+    @discord.ui.button(label="🎲 Take Card", style=discord.ButtonStyle.primary, custom_id="take_card")
+    async def take_card(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Take card button callback"""
+        try:
+            player_id = interaction.user.id
+            
+            # Validate game exists
+            if self.game_key not in active_games:
+                await interaction.response.send_message(
+                    "❌ This game is no longer active!", 
+                    ephemeral=True
+                )
+                return
+            
+            game_state = active_games[self.game_key]
+            
+            # Validate player is in game
+            player_data = game_state.get_player_data(player_id)
+            if not player_data:
+                await interaction.response.send_message(
+                    "❌ You're not a player in this game!", 
+                    ephemeral=True
+                )
+                return
+            
+            # Validate it's player's turn
+            if player_id != game_state.current_turn_id:
+                await interaction.response.send_message(
+                    "❌ It's not your turn!", 
+                    ephemeral=True
+                )
+                return
+            
+            # Validate player hasn't continued
+            if player_data.continued:
+                await interaction.response.send_message(
+                    "❌ You already chose to stay! Cannot take more cards.", 
+                    ephemeral=True
+                )
+                return
+            
+            # Validate deck has cards
+            if not game_state.deck:
+                await interaction.response.send_message("❌ The deck is empty!", ephemeral=True)
+                await GameManager.end_game(self.game_key, GameEndReason.DECK_EMPTY)
+                return
+            
+            # Cancel current tasks
+            game_state.cleanup()
+            
+            # Deal card
+            new_card = game_state.deck.pop()
+            player_data.cards.append(new_card)
+            
+            # Reset timer for same player after taking card
+            game_state.reset_turn_timer()
+            
+            # Send updated hand
+            embed = EmbedCreator.create_private_hand_embed(player_data)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            
+            # Check for bust
+            if player_data.is_bust:
+                opponent_data = game_state.get_opponent_data(player_id)
+                await GameManager.end_game(self.game_key, GameEndReason.BUST, winner=opponent_data.user)
+                logger.info(f"{interaction.user} went bust with {player_data.total}")
+            else:
+                # Create new tasks with fresh timer
+                timer_task = await GameManager.create_timer_task(self.game_key)
+                updater_task = await GameManager.create_display_updater_task(self.game_key)
+                game_state.add_task(timer_task)
+                game_state.add_task(updater_task)
+                
+                # Update display immediately to show fresh timer
+                await GameManager.update_public_embed(self.game_key)
+                
+            logger.info(f"Take Card used by {interaction.user}, drew {new_card}")
+            
+        except Exception as e:
+            logger.error(f"Take card error: {e}")
+            try:
+                await interaction.response.send_message(
+                    "❌ Error taking card. Try again.", 
+                    ephemeral=True
+                )
+            except:
+                pass
+    
+    @discord.ui.button(label="✋ Stay", style=discord.ButtonStyle.success, custom_id="stay")
+    async def stay(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Stay/continue button callback"""
+        try:
+            player_id = interaction.user.id
+            
+            # Validate game exists
+            if self.game_key not in active_games:
+                await interaction.response.send_message(
+                    "❌ This game is no longer active!", 
+                    ephemeral=True
+                )
+                return
+            
+            game_state = active_games[self.game_key]
+            
+            # Validate player is in game
+            player_data = game_state.get_player_data(player_id)
+            if not player_data:
+                await interaction.response.send_message(
+                    "❌ You're not a player in this game!", 
+                    ephemeral=True
+                )
+                return
+            
+            # Validate it's player's turn
+            if player_id != game_state.current_turn_id:
+                await interaction.response.send_message(
+                    "❌ It's not your turn!", 
+                    ephemeral=True
+                )
+                return
+            
+            # Validate player hasn't already continued
+            if player_data.continued:
+                await interaction.response.send_message(
+                    "❌ You already chose to stay!", 
+                    ephemeral=True
+                )
+                return
+            
+            # Cancel current tasks
+            game_state.cleanup()
+            
+            # Set continued status
+            player_data.continued = True
+            await interaction.response.send_message(
+                "✅ You chose to stay with your current cards. Turn passes to opponent.", 
+                ephemeral=True
+            )
+            
+            # Check if both players continued
+            if game_state.both_continued:
+                await GameManager.end_game(self.game_key, GameEndReason.REVEAL)
+                logger.info(f"Game {self.game_key} ended - both players stayed")
+            else:
+                # Switch turn (this will reset timer automatically)
+                game_state.switch_turn()
+                
+                # Create new tasks with fresh timer
+                timer_task = await GameManager.create_timer_task(self.game_key)
+                updater_task = await GameManager.create_display_updater_task(self.game_key)
+                game_state.add_task(timer_task)
+                game_state.add_task(updater_task)
+                
+                # Update display immediately to show fresh timer
+                await GameManager.update_public_embed(self.game_key)
+            
+            logger.info(f"Stay used by {interaction.user}")
+            
+        except Exception as e:
+            logger.error(f"Stay error: {e}")
+            try:
+                await interaction.response.send_message(
+                    "❌ Error processing stay. Try again.", 
+                    ephemeral=True
+                )
+            except:
+                pass
+
+class RematchView(discord.ui.View):
+    """Rematch/Exit view after elimination"""
+    
+    def __init__(self, match_key: frozenset):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.match_key = match_key
+    
+    @discord.ui.button(label="✅ Rematch", style=discord.ButtonStyle.success, custom_id="rematch")
+    async def rematch(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Start new match button callback"""
+        try:
+            player_id = interaction.user.id
+            
+            # Validate match exists
+            if self.match_key not in active_matches:
+                await interaction.response.send_message(
+                    "❌ This match is no longer available!", 
+                    ephemeral=True
+                )
+                return
+            
+            match_data = active_matches[self.match_key]
+            player_match_data = match_data.get_player_data(player_id)
+            
+            # Validate player is in match
+            if not player_match_data:
+                await interaction.response.send_message(
+                    "❌ You're not a player in this match!", 
+                    ephemeral=True
+                )
+                return
+            
+            # Reset HP and start new match
+            match_data.player1.hp = config.STARTING_HP
+            match_data.player2.hp = config.STARTING_HP
+            match_data.game_number = 1
+            match_data.status = MatchStatus.ACTIVE
+            
+            # Start first game
+            await MatchManager.start_new_game(self.match_key)
+            
+            await interaction.response.send_message(
+                f"🔄 **Rematch started!** Both players reset to {config.STARTING_HP} HP. Good luck!",
+                ephemeral=True
+            )
+            
+            logger.info(f"Rematch started by {interaction.user}")
+            
+        except Exception as e:
+            logger.error(f"Rematch error: {e}")
+            try:
+                await interaction.response.send_message(
+                    "❌ Error starting rematch. Try again.", 
+                    ephemeral=True
+                )
+            except:
+                pass
+    
+    @discord.ui.button(label="❌ Exit", style=discord.ButtonStyle.danger, custom_id="exit")
+    async def exit_match(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Exit match button callback"""
+        try:
+            player_id = interaction.user.id
+            
+            # Validate match exists
+            if self.match_key not in active_matches:
+                await interaction.response.send_message(
+                    "❌ This match is no longer available!", 
+                    ephemeral=True
+                )
+                return
+            
+            match_data = active_matches[self.match_key]
+            player_match_data = match_data.get_player_data(player_id)
+            
+            # Validate player is in match
+            if not player_match_data:
+                await interaction.response.send_message(
+                    "❌ You're not a player in this match!", 
+                    ephemeral=True
+                )
+                return
+            
+            # Clean up match
+            await MatchManager.end_match(self.match_key)
+            
+            await interaction.response.send_message(
+                "👋 **Match ended!** Thanks for playing. Use `/play` to start a new battle!",
+                ephemeral=True
+            )
+            
+            # Update message to show match ended
+            embed = discord.Embed(
+                title="🏁 Match Session Ended",
+                description="Players have left the battle. Use `/play` to start a new HP battle!",
+                color=discord.Color.greyple()
+            )
+            
+            try:
+                await interaction.edit_original_response(embed=embed, view=None)
+            except:
+                pass
+            
+            logger.info(f"Match exited by {interaction.user}")
+            
+        except Exception as e:
+            logger.error(f"Exit match error: {e}")
+            try:
+                await interaction.response.send_message(
+                    "❌ Error exiting match. Try again.", 
+                    ephemeral=True
+                )
+            except:
+                pass
 
 # ==================== GAME MANAGEMENT ====================
 
 class GameManager:
-    """Centralized game management with better resource handling"""
+    """Enhanced game management with HP system"""
     
     @staticmethod
     async def update_public_embed(game_key: frozenset) -> None:
@@ -525,13 +986,14 @@ class GameManager:
         winner: Optional[discord.Member] = None, 
         timed_out_player: Optional[discord.Member] = None
     ) -> None:
-        """End game with proper cleanup and stats update"""
+        """End game with proper HP system and match continuation logic"""
         if game_key not in active_games:
             return
         
         game_state = active_games.pop(game_key)
+        match_data = game_state.match_data
         
-        # Determine final winner/loser for stats
+        # Determine final winner/loser for this game
         final_winner, final_loser = None, None
         
         if reason in [GameEndReason.BUST, GameEndReason.TIMEOUT]:
@@ -547,16 +1009,25 @@ class GameManager:
                 final_winner, final_loser = game_state.player1.user, game_state.player2.user
             elif p2_score > p1_score:
                 final_winner, final_loser = game_state.player2.user, game_state.player1.user
+            # If tie, no HP change
         
-        # Update stats
+        # Update HP if there's a winner
         if final_winner and final_loser:
+            winner_match_data = match_data.get_player_data(final_winner.id)
+            loser_match_data = match_data.get_player_data(final_loser.id)
+            
+            bet_amount = match_data.current_bet
+            winner_match_data.hp += bet_amount
+            loser_match_data.hp -= bet_amount
+            
+            # Update game statistics
             stats_manager.update_game_result(final_winner.id, final_loser.id)
             stats_manager.save_stats()
         
         # Cleanup resources
         game_state.cleanup()
         
-        # Update message
+        # Update message with game results (show for 3 seconds)
         if game_state.public_message:
             try:
                 embed = EmbedCreator.create_endgame_embed(
@@ -567,6 +1038,17 @@ class GameManager:
                 logger.warning(f"Public message not found for ended game")
             except Exception as e:
                 logger.error(f"Error updating endgame embed: {e}")
+        
+        # Wait a moment to show results, then decide what to do next
+        await asyncio.sleep(3)
+        
+        # Check for elimination
+        if match_data.has_elimination:
+            # ELIMINATION: Show match results with rematch options
+            await MatchManager.handle_elimination(game_key)
+        else:
+            # NO ELIMINATION: Continue to next game automatically
+            await MatchManager.start_next_game(game_key)
     
     @staticmethod
     async def create_timer_task(game_key: frozenset) -> asyncio.Task:
@@ -604,6 +1086,127 @@ class GameManager:
                 pass
         
         return asyncio.create_task(updater_task())
+
+# ==================== MATCH MANAGEMENT ====================
+
+class MatchManager:
+    """Match management system for HP battles"""
+    
+    @staticmethod
+    async def start_new_game(match_key: frozenset) -> None:
+        """Start a new game within existing match"""
+        if match_key not in active_matches:
+            return
+            
+        match_data = active_matches[match_key]
+        player1, player2 = match_data.player1.user, match_data.player2.user
+        channel = match_data.channel
+        
+        if not channel:
+            logger.error(f"No channel reference for match {match_key}")
+            return
+        
+        # Create new game state
+        game_state = GameState(player1, player2, channel, match_data)
+        active_games[match_key] = game_state
+        
+        # Send new game message
+        embed = EmbedCreator.create_game_embed(game_state)
+        view = GameView(match_key)
+        
+        try:
+            message = await channel.send(
+                f"🎮 **Game {match_data.game_number} Starting!** "
+                f"Betting **{match_data.current_bet} HP**",
+                embed=embed, view=view
+            )
+            game_state.public_message = message
+        except Exception as e:
+            logger.error(f"Error sending new game message: {e}")
+            return
+        
+        # Create and track tasks
+        timer_task = await GameManager.create_timer_task(match_key)
+        updater_task = await GameManager.create_display_updater_task(match_key)
+        game_state.add_task(timer_task)
+        game_state.add_task(updater_task)
+        
+        # REMOVED: DM sending logic - cards will only be visible via "View Cards" button
+        # Send reminder message instead
+        await channel.send(
+            f"🃏 {player1.mention} {player2.mention} - "
+            f"Use the **🃏 View Cards** button to see your starting hands!",
+            delete_after=10
+        )
+        
+        logger.info(f"Started game {match_data.game_number} for match {match_key}")
+    
+    @staticmethod
+    async def start_next_game(match_key: frozenset) -> None:
+        """Start next game in sequence"""
+        if match_key not in active_matches:
+            return
+            
+        match_data = active_matches[match_key]
+        match_data.game_number += 1
+        
+        # Send transition message
+        if match_data.channel:
+            try:
+                await match_data.channel.send(
+                    f"🔄 **Continuing Match!** Game {match_data.game_number} starting in 3 seconds...",
+                    delete_after=3
+                )
+                await asyncio.sleep(3)
+            except Exception as e:
+                logger.error(f"Error sending transition message: {e}")
+        
+        await MatchManager.start_new_game(match_key)
+    
+    @staticmethod
+    async def handle_elimination(match_key: frozenset) -> None:
+        """Handle player elimination and show rematch options"""
+        if match_key not in active_matches:
+            return
+            
+        match_data = active_matches[match_key]
+        match_data.status = MatchStatus.ELIMINATION
+        
+        winner = match_data.winner
+        eliminated = match_data.player1 if match_data.player1.is_eliminated else match_data.player2
+        
+        # Update match statistics
+        stats_manager.update_match_result(winner.user.id, eliminated.user.id)
+        stats_manager.save_stats()
+        
+        # Create elimination embed with rematch options
+        embed = EmbedCreator.create_elimination_embed(match_data)
+        view = RematchView(match_key)
+        
+        # Send elimination message in the channel
+        if match_data.channel:
+            try:
+                await match_data.channel.send(
+                    f"💀 **MATCH OVER!** {winner.user.mention} wins the HP battle!",
+                    embed=embed, view=view
+                )
+            except Exception as e:
+                logger.error(f"Error sending elimination message: {e}")
+        
+        logger.info(f"Match {match_key} ended with elimination. Winner: {winner.user}")
+    
+    @staticmethod
+    async def end_match(match_key: frozenset) -> None:
+        """Clean up and end match completely"""
+        if match_key in active_matches:
+            active_matches.pop(match_key)
+        
+        # Also clean up any active games for this match
+        if match_key in active_games:
+            game_state = active_games.pop(match_key)
+            game_state.cleanup()
+        
+        logger.info(f"Match {match_key} completely ended and cleaned up")
 
 # ==================== BOT SETUP ====================
 
@@ -643,7 +1246,7 @@ async def on_ready():
                 embed = EmbedCreator.create_help_embed()
                 embed.add_field(
                     name="🚀 Bot Status", 
-                    value="Bot is online and slash commands are ready!\nType `/` to see available commands.", 
+                    value="HP Battle System is online! Challenge opponents and fight until elimination!", 
                     inline=False
                 )
                 await channel.send(embed=embed)
@@ -668,7 +1271,7 @@ async def on_command_error(ctx, error):
 
 # ==================== SLASH COMMANDS ====================
 
-@bot.tree.command(name="help", description="Show bot help and commands")
+@bot.tree.command(name="help", description="Show bot help and HP battle system")
 async def help_slash(interaction: discord.Interaction):
     """Help command"""
     try:
@@ -678,9 +1281,9 @@ async def help_slash(interaction: discord.Interaction):
     except Exception as e:
         await handle_command_error(interaction, e, "help_slash")
 
-@bot.tree.command(name="play", description="Start a new Twenty One game")
+@bot.tree.command(name="play", description="Start a new HP Battle match")
 async def play_slash(interaction: discord.Interaction, opponent: discord.Member):
-    """Start new game command"""
+    """UPDATED: Start new HP battle match - NO DM VERSION"""
     try:
         logger.info(f"Play command: {interaction.user} vs {opponent}")
         
@@ -694,161 +1297,57 @@ async def play_slash(interaction: discord.Interaction, opponent: discord.Member)
             await interaction.response.send_message("❌ You cannot challenge yourself!", ephemeral=True)
             return
         
-        game_key = frozenset({player1.id, player2.id})
-        if game_key in active_games:
+        match_key = frozenset({player1.id, player2.id})
+        if match_key in active_matches:
             await interaction.response.send_message(
-                "❌ A game between these players is already in progress!", 
+                "❌ A match between these players is already in progress!", 
                 ephemeral=True
             )
             return
         
-        # Create game
-        game_state = GameState(player1, player2, interaction.channel)
-        active_games[game_key] = game_state
+        # Create match data with channel reference
+        match_data = MatchData(
+            MatchPlayerData(player1),
+            MatchPlayerData(player2),
+            channel=interaction.channel
+        )
+        active_matches[match_key] = match_data
         
-        await interaction.response.send_message("🎲 Setting up the game...")
+        # Create first game
+        game_state = GameState(player1, player2, interaction.channel, match_data)
+        active_games[match_key] = game_state
+        
+        await interaction.response.send_message("🎲 Starting HP Battle...")
         game_state.public_message = await interaction.original_response()
         
         # Create and track tasks
-        timer_task = await GameManager.create_timer_task(game_key)
-        updater_task = await GameManager.create_display_updater_task(game_key)
+        timer_task = await GameManager.create_timer_task(match_key)
+        updater_task = await GameManager.create_display_updater_task(match_key)
         game_state.add_task(timer_task)
         game_state.add_task(updater_task)
         
-        await GameManager.update_public_embed(game_key)
+        await GameManager.update_public_embed(match_key)
         
-        # Send initial hands
-        p1_embed = EmbedCreator.create_private_hand_embed(game_state.player1)
-        await interaction.followup.send(embed=p1_embed, ephemeral=True)
+        # CHANGED: Send ephemeral hand to player1 (the one who started the match)
+        try:
+            p1_embed = EmbedCreator.create_private_hand_embed(game_state.player1)
+            await interaction.followup.send(embed=p1_embed, ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error sending ephemeral hand to player1: {e}")
         
+        # CHANGED: Send public message reminder for both players
         await interaction.followup.send(
-            f"{player2.mention}, click the **🃏 View Cards** button to see your starting hand!",
-            ephemeral=True
+            f"🎮 {player1.mention} {player2.mention} - HP Battle has started! "
+            f"Each player starts with **{config.STARTING_HP} HP**. "
+            f"Click the **🃏 View Cards** button above to see your starting hands!",
+            ephemeral=False
         )
         
-        logger.info(f"Game started between {player1} and {player2}")
+        logger.info(f"HP Battle started between {player1} and {player2} - NO DM VERSION")
     except Exception as e:
         await handle_command_error(interaction, e, "play_slash")
 
-@bot.tree.command(name="drink", description="Take another card")
-async def drink_slash(interaction: discord.Interaction):
-    """Take card command"""
-    try:
-        logger.info(f"Drink command used by {interaction.user}")
-        
-        player_id = interaction.user.id
-        game_key = next((key for key in active_games if player_id in key), None)
-        
-        if not game_key:
-            await interaction.response.send_message("❌ You're not in an active game!", ephemeral=True)
-            return
-        
-        game_state = active_games[game_key]
-        
-        # Validation
-        if player_id != game_state.current_turn_id:
-            await interaction.response.send_message("❌ It's not your turn!", ephemeral=True)
-            return
-        
-        player_data = game_state.get_player_data(player_id)
-        if player_data.continued:
-            await interaction.response.send_message(
-                "❌ You already chose to continue! Cannot take more cards.", 
-                ephemeral=True
-            )
-            return
-        
-        if not game_state.deck:
-            await interaction.response.send_message("❌ The deck is empty!", ephemeral=True)
-            await GameManager.end_game(game_key, GameEndReason.DECK_EMPTY)
-            return
-        
-        # Cancel current tasks
-        game_state.cleanup()
-        
-        # Deal card
-        new_card = game_state.deck.pop()
-        player_data.cards.append(new_card)
-        
-        # IMPORTANT: Reset timer for same player after drinking
-        game_state.reset_turn_timer()
-        
-        # Send updated hand
-        embed = EmbedCreator.create_private_hand_embed(player_data)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        
-        # Check for bust
-        if player_data.is_bust:
-            opponent_data = game_state.get_opponent_data(player_id)
-            await GameManager.end_game(game_key, GameEndReason.BUST, winner=opponent_data.user)
-            logger.info(f"{interaction.user} went bust with {player_data.total}")
-        else:
-            # Create new tasks with fresh timer
-            timer_task = await GameManager.create_timer_task(game_key)
-            updater_task = await GameManager.create_display_updater_task(game_key)
-            game_state.add_task(timer_task)
-            game_state.add_task(updater_task)
-            
-            # Update display immediately to show fresh timer
-            await GameManager.update_public_embed(game_key)
-    except Exception as e:
-        await handle_command_error(interaction, e, "drink_slash")
-
-@bot.tree.command(name="continue", description="Keep current cards and end your turn")
-async def continue_slash(interaction: discord.Interaction):
-    """Continue with current cards command"""
-    try:
-        logger.info(f"Continue command used by {interaction.user}")
-        
-        player_id = interaction.user.id
-        game_key = next((key for key in active_games if player_id in key), None)
-        
-        if not game_key:
-            await interaction.response.send_message("❌ You're not in an active game!", ephemeral=True)
-            return
-        
-        game_state = active_games[game_key]
-        
-        # Validation
-        if player_id != game_state.current_turn_id:
-            await interaction.response.send_message("❌ It's not your turn!", ephemeral=True)
-            return
-        
-        player_data = game_state.get_player_data(player_id)
-        if player_data.continued:
-            await interaction.response.send_message("❌ You already chose to continue!", ephemeral=True)
-            return
-        
-        # Cancel current tasks
-        game_state.cleanup()
-        
-        # Set continued status
-        player_data.continued = True
-        await interaction.response.send_message(
-            "✅ You chose to continue with your current cards. Turn passes to opponent.", 
-            ephemeral=True
-        )
-        
-        # Check if both players continued
-        if game_state.both_continued:
-            await GameManager.end_game(game_key, GameEndReason.REVEAL)
-            logger.info(f"Game {game_key} ended - both players continued")
-        else:
-            # Switch turn (this will reset timer automatically)
-            game_state.switch_turn()
-            
-            # Create new tasks with fresh timer
-            timer_task = await GameManager.create_timer_task(game_key)
-            updater_task = await GameManager.create_display_updater_task(game_key)
-            game_state.add_task(timer_task)
-            game_state.add_task(updater_task)
-            
-            # Update display immediately to show fresh timer
-            await GameManager.update_public_embed(game_key)
-    except Exception as e:
-        await handle_command_error(interaction, e, "continue_slash")
-
-@bot.tree.command(name="profil", description="View player's game statistics")
+@bot.tree.command(name="profil", description="View player's game and match statistics")
 async def profile_slash(interaction: discord.Interaction, user: discord.Member):
     """View profile statistics command"""
     try:
@@ -860,7 +1359,7 @@ async def profile_slash(interaction: discord.Interaction, user: discord.Member):
     except Exception as e:
         await handle_command_error(interaction, e, "profile_slash")
 
-@bot.tree.command(name="stats", description="View your game statistics")
+@bot.tree.command(name="stats", description="View your game and match statistics")
 async def stats_slash(interaction: discord.Interaction):
     """View own statistics command"""
     try:
@@ -914,16 +1413,26 @@ def get_game_by_player(player_id: int) -> Optional[Tuple[frozenset, GameState]]:
             return game_key, game_state
     return None
 
+def get_match_by_player(player_id: int) -> Optional[Tuple[frozenset, MatchData]]:
+    """Get match containing specific player"""
+    for match_key, match_data in active_matches.items():
+        if player_id in match_key:
+            return match_key, match_data
+    return None
+
 async def cleanup_all_games():
-    """Clean up all active games on shutdown"""
-    logger.info("Cleaning up all active games...")
+    """Clean up all active games and matches on shutdown"""
+    logger.info("Cleaning up all active games and matches...")
+    
     for game_state in active_games.values():
         game_state.cleanup()
     active_games.clear()
     
+    active_matches.clear()
+    
     # Save final stats
     stats_manager.save_stats()
-    logger.info("All games cleaned up")
+    logger.info("All games and matches cleaned up")
 
 # ==================== MAIN EXECUTION ====================
 
@@ -942,8 +1451,8 @@ def main():
         if not validate_environment():
             return
         
-        logger.info("Starting Twenty One Bot...")
-        logger.info(f"Configuration: Timeout={config.GAME_TIMEOUT}s, Max Card={config.MAX_CARD_VALUE}")
+        logger.info("Starting Twenty One Bot with HP Battle System...")
+        logger.info(f"Configuration: Timeout={config.GAME_TIMEOUT}s, Max Card={config.MAX_CARD_VALUE}, Starting HP={config.STARTING_HP}")
         
         # Register cleanup on bot close
         @bot.event
